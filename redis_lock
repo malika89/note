@@ -1,0 +1,108 @@
+#!/usr/bin/python
+# coding:utf-8
+
+from redis import Redis
+import logging
+import uuid
+import time
+import threading
+import pymysql
+
+
+class RedisX(Redis):
+    def __init__(self, host='localhost', port=6379, db=0, password=None, username=None, **kwargs):
+        self.Locker = None
+        super().__init__(host, port, db, password, username, **kwargs)
+
+    # 查询被那个线程或者pid获取
+
+    def set(self, k, value, expire):
+        acquired = False
+        while not acquired:
+            acquired = self.acquire_lock(k)
+            logging.info(f"key{k}is been used by others ")
+            continue
+        logging.info(f"get the key now !!!!:{k}")
+        super().set(k, value, expire)
+        self.release_lock(k, acquired)
+
+    # 获取一个锁
+    def acquire_lock(self, lock_name, acquire_time=10, timeout=10):
+        identifier = str(uuid.UUID)
+        end_time = time.time()+acquire_time
+        lock = "lock:"+lock_name
+        while time.time() <end_time:
+            if self.setnx(lock, identifier):
+                self.expire(lock, timeout)
+                return identifier
+            elif not self.ttl(lock):
+                self.expire(lock, timeout)
+            time.sleep(0.001)
+        return False
+
+    # 释放一个锁
+    def release_lock(self, lock_name, identifier):
+        lock = "lock:"+lock_name
+        pipe = self.pipeline(True)
+        while True:
+            try:
+                pipe.watch(lock)
+                lock_value = self.get(lock)
+                if not lock_value:
+                    return True
+                if lock_value.decode() == identifier:
+                    pipe.multi()
+                    pipe.delete(lock)
+                    pipe.execute()
+                    return True
+                pipe.unwatch()
+                break
+            except Exception:
+                pass
+        return False
+
+
+def get_stock_db():
+    db = pymysql.connect(host="10.25.72.208",port=3306,user="root",password="PACloud@20!^",database="test")
+    cursor = db.cursor()
+    sql = 'select no from resource where name="ticket"'
+    cursor.execute(sql)
+    ret = cursor.fetchone()
+    cursor.close()
+    db.close()
+    return ret[0]
+
+
+def update_stock_db(stock):
+    db = pymysql.connect(host="10.25.72.208",port=3306,user="root",password="PACloud@20!^",database="test")
+    cursor = db.cursor()
+    sql = "update resource set no={} where name='ticket'".format(stock-1)
+    try:
+        cursor.execute(sql)
+        db.commit()
+    except Exception as e:
+        print(e)
+    cursor.close()
+    db.close()
+    return stock-1
+
+
+def seckill(i):
+    # identifier=acquire_lock('resource')
+    # print("线程:{}--获得了锁".format(i))
+    time.sleep(1)
+    now_stock = int(get_stock_db())
+    if now_stock<1:
+        print("线程:{}--没抢到，票抢完了 \n".format(i))
+        return
+    now_stock = update_stock_db(now_stock)
+    print("=== 线程:{}--抢到一张票，还剩{}张票 \n".format(i,now_stock))
+    # release_lock('resource',identifier)
+
+
+if __name__ == '__main__':
+    # client = RedisX(host="10.25.72.208", port="6379", db=1, password="PACloud@20!^")
+    totalNum = 10
+    for i in range(30):
+        t = threading.Thread(target=seckill, args=(i,))
+        t.start()
