@@ -5,7 +5,7 @@ from redis import Redis
 import logging
 import uuid
 import time
-from threading import Thread
+from threading import Thread,Lock
 import pymysql
 import random
 
@@ -79,8 +79,10 @@ class ThreadWithReturnValue(Thread):
 
 
 def deal_with_mysql(m):
+    lock = Lock()
 
     def deal_stock_db(n, user):
+        lock.acquire()
         db = pymysql.connect(host="10.25.72.208", port=3306, user="root", password="PACloud@20!^", database="test")
         cursor = db.cursor()
         db.begin()
@@ -90,6 +92,7 @@ def deal_with_mysql(m):
         if ret[0] < n:
             cursor.close()
             db.close()
+            lock.release()
             return "no stock"
         try:
             update_sql = "update resource set no={} where name='ticket'".format(ret[0] - n)
@@ -97,21 +100,22 @@ def deal_with_mysql(m):
             sql = 'insert into records(user,no) values("{}",{})'.format(user, n)
             cursor.execute(sql)
             db.commit()
+            lock.release()
         except Exception as e:
             print(e)
             pass
-    start_time = time.time()
     for i in range(m):
         per_ticket = random.randint(1, 2)
         t = ThreadWithReturnValue(target=deal_stock_db, args=(per_ticket,f'user_{i}'))
         t.start()
-    print("票已售完,耗时:", time.time()-start_time)
-
+    print("票已售完")
 
 
 if __name__ == '__main__':
     # client = RedisX(host="10.25.72.208", port="6379", db=1, password="PACloud@20!^")
     totalNum = 30
     # 100个人抢30张票
-    deal_with_mysql(100)
+    start_time = time.time()
+    deal_with_mysql(1000)
+    print("mysql 锁售票完成耗时：",time.time()-start_time)
 
