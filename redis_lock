@@ -2,7 +2,6 @@
 # coding:utf-8
 
 from redis import Redis
-import logging
 import uuid
 import time
 from threading import Thread,Lock
@@ -12,55 +11,27 @@ import random
 
 class RedisX(Redis):
 
-    def __init__(self, host='localhost', port=6379, db=0, password=None, username=None, **kwargs):
-        self.Locker = None
-        super().__init__(host, port, db, password, username, **kwargs)
+    def __init__(self, host='localhost', port=6379, db=0, password=None, username=None, decode_responses=True,**kwargs):
+        super().__init__(host, port, db, password, username=username,decode_responses=decode_responses, **kwargs)
 
-    # 查询被那个线程或者pid获取
-
-    def set(self, k, value, expire):
-        acquired = False
-        while not acquired:
-            acquired = self.acquire_lock(k)
-            logging.info(f"key{k}is been used by others ")
-            continue
-        logging.info(f"get the key now !!!!:{k}")
-        super().set(k, value, expire)
-        self.release_lock(k, acquired)
+    def set(self, k, value, expire=0):
+        super().set(k, value)
 
     # 获取一个锁
-    def acquire_lock(self, lock_name, acquire_time=10, timeout=10):
-        identifier = str(uuid.UUID)
+    def acquire_lock(self, lock_name, acquire_time=10):
+        identifier = str(uuid.uuid4())
         end_time = time.time()+acquire_time
-        lock = "lock:"+lock_name
-        while time.time() <end_time:
-            if self.setnx(lock, identifier):
-                self.expire(lock, timeout)
+        while time.time() < end_time:
+            if self.setnx(lock_name, identifier):
                 return identifier
-            elif not self.ttl(lock):
-                self.expire(lock, timeout)
             time.sleep(0.001)
         return False
 
     # 释放一个锁
     def release_lock(self, lock_name, identifier):
-        lock = "lock:"+lock_name
-        pipe = self.pipeline(True)
-        while True:
-            try:
-                pipe.watch(lock)
-                lock_value = self.get(lock)
-                if not lock_value:
-                    return True
-                if lock_value.decode() == identifier:
-                    pipe.multi()
-                    pipe.delete(lock)
-                    pipe.execute()
-                    return True
-                pipe.unwatch()
-                break
-            except Exception:
-                pass
+        if self.get(lock_name) == identifier:
+            self.delete(lock_name)
+            return True
         return False
 
 
@@ -79,11 +50,13 @@ class ThreadWithReturnValue(Thread):
 
 
 def deal_with_mysql(m):
+    start_time = time.time()
     lock = Lock()
+    threads = []
 
     def deal_stock_db(n, user):
         lock.acquire()
-        db = pymysql.connect(host="10.25.72.208", port=3306, user="root", password="PACloud@20!^", database="test")
+        db = pymysql.connect(host="127.0.0.1", port=3306, user="root", password="testpwd123", database="test")
         cursor = db.cursor()
         db.begin()
         sql = 'select no from resource where name="ticket" for update'
@@ -108,14 +81,51 @@ def deal_with_mysql(m):
         per_ticket = random.randint(1, 2)
         t = ThreadWithReturnValue(target=deal_stock_db, args=(per_ticket,f'user_{i}'))
         t.start()
-    print("票已售完")
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    print("票已售完:mysql 完成耗时：", time.time()-start_time)
+
+
+def deal_with_redis(m):
+    start_time = time.time()
+    threads = []
+
+    def deal_stock_redis(m, user):
+        client = RedisX(host="127.0.0.1", port=6379, db=1, password="testpwd123")
+        with client.pipeline() as p:
+            while True:
+                lock = client.acquire_lock("lock:stock")
+                if not lock:
+                    continue
+                p.watch(lock)
+                try:
+                    p.multi()
+                    count = int(client.get("stock"))
+                    if count>0 and count>=m:
+                       p.set("stock", count-m)
+                       p.execute()
+                    break
+                except Exception:
+                    pass
+                finally:
+                    res = client.release_lock("lock:stock",lock)
+                    if not res:
+                        client.delete("lock:stock")
+
+    for i in range(0, m):
+        per_ticket = random.randint(1, 2)
+        t = ThreadWithReturnValue(target=deal_stock_redis, args=(per_ticket, f'user_{i}'))
+        t.start()
+    print("票已售完:redis 完成耗时：", time.time()-start_time)
 
 
 if __name__ == '__main__':
-    # client = RedisX(host="10.25.72.208", port="6379", db=1, password="PACloud@20!^")
-    totalNum = 30
+    totalNum = 500
     # 100个人抢30张票
-    start_time = time.time()
     deal_with_mysql(1000)
-    print("mysql 锁售票完成耗时：",time.time()-start_time)
+    deal_with_redis(1000)
+
+
 
