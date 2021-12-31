@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # coding:utf-8
+"https://github.com/wawacode/python_miaosha/blob/main/app.py"
 
 from redis import Redis
 import uuid
