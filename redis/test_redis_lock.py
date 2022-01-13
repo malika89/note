@@ -6,7 +6,7 @@ import time
 
 
 def order(m):
-    conn = Redis(host="127.0.0.1", port=6379, db=1, password="PACloud@20!^")
+    conn = Redis(host="127.0.0.1", port=6379, db=1, password="test123")
     with redis_lock.Lock(conn, "stock") as l:
         now_stock = conn.get("stock")
         if now_stock >= m:
