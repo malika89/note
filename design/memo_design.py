@@ -7,9 +7,13 @@
   草稿箱
   游戏进度保存
   事务
+实现方式：
+  1. 手动state
+  2. 缓存(装饰器 || lur_cache)
 """
 
 import random
+import functions
 
 
 class Memento:
@@ -54,6 +58,30 @@ class FightCharactor(GameCharacter):
         self.vitality -= random.randint(1,10)
         self.attack += random.randint(2,6)
 
+class Memoize:
+    def __init__(self, f):
+        self.f = f
+        self.memo = {}
+
+    def __call__(self, *args):
+        if args not in self.memo:
+            self.memo[args] = self.f(*args)
+        return self.memo[args]
+
+
+def factorial(k):
+    if k < 2: return 1
+    return k * factorial(k - 1)
+
+factorial = Memoize(factorial)
+
+
+@functools.lru_cache(maxsize=None)
+def fib(num):
+    if num < 2:
+        return num
+    else:
+        return fib(num-1) + fib(num-2)
 
 if __name__ == "__main__":
     game_chrctr = FightCharactor()
