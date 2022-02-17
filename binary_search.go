@@ -2,6 +2,8 @@ package leetcode
 
 import "testing"
 
+//有序数组
+
 func BinarySearch(nums []int,target int) bool {
 	if len(nums) <=1 {
 		return nums[0]==target
