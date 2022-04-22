@@ -1,0 +1,247 @@
+### 什么是锁
+为了保证在多线程下处理共享数据（临界区）的安全性，需要保证在同一时刻只有一个线程能处理共享数据。
+上述描述可见，锁是互斥的、排他的、控制并发的。
+
+在golang里，提供了sync.Mutex  sync.RWMutex；当锁被某个线程持有时，另一个线程尝试去获取该锁时会失败或者阻塞，直到持有该锁的线程释放。
+
+#### 单实例内使用锁
+单实例内，通过线程间竞争一把全局锁即可
+
+#### 多实例使用锁
+多实例间，则需使用分布式锁来实现互斥，如图示
+
+它保证在分布式部署的应用集群中，多个服务请求同一个业务操作时，对应业务逻辑仅被一个实例执行，避免出现并发问题。
+ 
+#### 完备的分布式锁所需特性
+ + 互斥：基本特性，同一时刻仅有一个实例（线程）获得锁，执行临界区操作
+ + 超时释放：防止不必要的线程等待、资源浪费
+ + 可重入：同一个实例（线程）再次请求时还是成功的
+ + 高性能、高可用：加锁、解锁开销尽可能低，保证高可用，防止分布式锁失效
+ + 支持阻塞和非阻塞：通常在客户端代码实现阻塞操作
+
+
+-----
+
+
+### 常见实现方案
+  + 数据库
+  + redis
+  + zookeeper
+  
+#### 基于关系型数据库实现
+
+-----
+
+
+它依赖数据库的唯一性（ACID）实现资源锁定，比如主键、唯一索引等
+如下（定义了资源、失效时间字段，对资源加了唯一索引）：
+ + 需要锁住某个资源时，在该表中插入一条资源记录即可，插入成功则获得锁，删除则释放该锁
+
+```
+create table distributed_locker
+(
+    id serial not null
+        constraint distributed_locker_pk
+            primary key,
+    resource varchar(255),
+    expire timestamp
+);
+ 
+comment on table distributed_locker is '分布式锁';
+ 
+comment on column distributed_locker.resource is '锁定的资源，比如随机字符串';
+ 
+comment on column distributed_locker.expire is '过期时间';
+ 
+create unique index distributed_locker_resource_uindex
+    on distributed_locker (resource);
+```
+
+
+唯一性约束：多个请求同时提交到数据库，会保证仅有一个操作成功。
+
+该方案实现较为简单，但存在多个待优化之处：
+```
+ + 单点故障风险：强依赖数据库的可用性，数据库挂了则业务系统不可用（主从架构提升可用性）
+ + 超时无法释放：一旦解锁失败，锁的记录一致保存在数据库中，其他实例无法获得锁（添加定时任务，比对时间戳是否过期）
+ + 不可重入：同一个实例在没释放锁前，无法再次获得锁，因锁记录已在数据库中，无法再次写入（获锁方法需改造，可额外保存实例信息用于判断，不阻塞已获得锁的线程再次请求获得锁）
+ + 读写库操作耗时：读写数据库消耗一定的性能，需要额外关注对业务逻辑处理耗时影响
+```
+
+
+#### 基于redis实现
+
+
+-----
+
+
+
+##### 基于setnx实现
+setnx 将key设置值为value，如果key不存在，这种情况下等同SET命令。 当key存在时，什么也不做。 http://redis.cn/commands/setnx.html
+
+* 算法思路：
+  + 相同资源key，随机数作为值
+  + 设置成功返回1，获得锁，做临界区业务逻辑操作
+  + 设置失败返回0，阻塞等待重试
+ 
+```
+ok, err := redis.SetNX("key", time.Now().Milliseconds())
+if ok {
+   // Lock(), do biz ops
+   defer redis.Del("key")
+} else {
+   // wait, retry to fetch locker
+}
+```
+
+
+* 存在问题：
+```
+   + 不支持超时释放：加锁宕机后，无法删除释放锁
+   + 不支持重入：相同键值，重复请求无法再次成功
+   + 出现多客户端获得锁场景：①C3获得锁并写入时间戳T3，C1 C2尝试获取失败返回（因由C3持有）②C1 发送 del key, setnx key timestamp1成功返回获得锁，C2 发送del key, setnx key timestamp2成功返回获得锁【出现竞态】
+   + 可行方案：C4发送setnx key T4失败，再发送get key 比对时间戳是否过期，若未过期则等待重试；若过期，发送getset key T4，判断返回值T比T4小（已过期）则获得锁，否则失败继续尝试；
+http://redis.cn/commands/getset.html
+```
+
+
+##### 基于setnx+exipre实现
+```
+ok, err := redis.SetNX("key", time.Now().Milliseconds())
+if ok {
+   // Lock(), do biz ops
+   defer redis.Del("key")
+   redis.Exipre("key", 3 * time.Seconds)
+} else {
+   // wait, retry to fetch locker
+}
+```
+
+* 存在问题：
+   + setnx  expire指令并不具备原子性：若setnx后宕机，设置过期时间失败，导致同上述问题出现
+
+
+##### 基于set扩展参数实现
+http://redis.cn/commands/set.html
+自2.6.12版本，支持set key value exipreTime nx
+
+```
+ok, err := redis.Set("key", time.Now().Milliseconds(), 3 * time.Seconds, redis.FlagNX)
+if ok {
+   // Lock(), do biz ops
+   redis.Del("key")
+} else {
+   // wait, retry to fetch locker
+}
+```
+
+ + NX – 只有键key不存在的时候才会设置key的值
+看着貌似解决了锁超时问题，但超时时间设置不合理，依然会出现竞态场景：（加锁、解锁之间的业务逻辑耗时过长，超过了锁的超时时间，自动删除了键值，其他实例线程获得锁，出现并发操作）
+ + C1 获得锁，超时为2秒，业务逻辑耗时3秒
+ + 锁被redis过期机制释放，删除key
+ + C1执行结束，此时锁已被C2获得，若执行主动释放操作，则释放的是C2的锁
+
+* 解决思路：
+   + 存储值为随机值，C1--V1，C2–V2
+   + 释放时采用redis lua脚本
+  
+ 
+```
+if redis.call("get",KEYS[1]) == ARGV[1]
+then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
+```
+
+##### redlock方案
+https://redis.io/topics/distlock
+
+
+#### 基于zookeeper实现
+
+
+-----
+现用的例子防火墙分布式锁连接demo
+zookeeper维护了一套类unix文件系统的树形结构，每个节点成为znode（通过绝对路径定位znode）
+znode兼具文件和目录特点，维护着数据、元信息、ACL、时间戳等，由3部分组成：
+ + data：关联的自定义数据
+ + children：子节点列表
+ + stat：状态信息，包含znode的版本、时间戳、临时节点所属者、数据长度、子节点数量等
+```	
+type Stat struct {
+    Czxid          int64 // The zxid of the change that caused this znode to be created.
+    Mzxid          int64 // The zxid of the change that last modified this znode.
+    Ctime          int64 // The time in milliseconds from epoch when this znode was created.
+    Mtime          int64 // The time in milliseconds from epoch when this znode was last modified.
+    Version        int32 // The number of changes to the data of this znode.
+    Cversion       int32 // The number of changes to the children of this znode.
+    Aversion       int32 // The number of changes to the ACL of this znode.
+    EphemeralOwner int64 // The session id of the owner of this znode if the znode is an ephemeral node. If it is not an ephemeral node, it will be zero.
+    DataLength     int32 // The length of the data field of this znode.
+    NumChildren    int32 // The number of children of this znode.
+    Pzxid          int64 // last modified children
+}
+```
+
+* 节点类型：
+    + 临时节点、永久节点（区别在于是否与会话相关联）【客户端与zk服务器建立连接称为一次会话】【可以是长连接，通过心跳PING包保持有效会话】
+    + 临时节点生命周期依赖于会话，会话结束，临时节点被自动删除【也可手动删除】（临时节点不允许拥有子节点）
+    + 永久节点不依赖与会话，需显示触发删除，会话终止节点可继续存在
+
+顺序节点：
+当创建Znode的时候，用户可以请求在ZooKeeper的路径结尾添加一个递增的计数。这个计数对于此节点的父节点来说是唯一的，当客户端请求创建这个节点A后，ZooKeeper会根据父节点的zxid状态，为这个A节点编写一个全目录唯一的编号（这个编号只会一直增长）。这样的节点称为顺序节点。
+
+```
+func (c *Conn) Create(path string, data []byte, flags int32, acl []ACL) (string, error) {
+    if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
+        return "", err
+    }
+ 
+    res := &createResponse{}
+    _, err := c.request(opCreate, &CreateRequest{path, data, acl, flags}, res, nil)
+    return res.Path, err
+}
+```
+
+
+•	PERSISTENT-持久化目录节点
+客户端与ZooKeeper断开连接后，该节点依旧存在
+•	PERSISTENT_SEQUENTIAL-持久化顺序编号目录节点
+客户端与ZooKeeper断开连接后，该节点依旧存在，只是ZooKeeper给该节点名称进行顺序编号
+•	EPHEMERAL-临时目录节点
+客户端与ZooKeeper断开连接后，该节点被删除
+•	EPHEMERAL_SEQUENTIAL-临时顺序编号目录节点
+客户端与ZooKeeper断开连接后，该节点被删除，只是ZooKeeper给该节点名称进行顺序编号
+
+
+* 算法思路：
+   + 创建临时有序节点，客户端A对应子节点/fw_locks/10.15.101.12/0001，客户端B对应子节点/fw_locks/10.15.101.12/0002
+   + 获取/fw_locks/10.15.101.12子节点列表，判断是否为当前列表中最小序号的节点
+   + 如果是，则为获得锁；如果不是，则通过watch事件监听节点/fw_locks/10.15.101.12重复尝试获得锁
+   + 完成业务逻辑执行，关闭会话自动删除节点
+   + 参考资料：https://www.jianshu.com/p/e01e2e09fff5
+
+
+### redis高可用问题
+为保证高可用，redis在生产时通常采用集群式部署，数据通过主从复制，是异步的，故障转移过程丧失所的安全性。
+
+```
+    + 在master节点获得锁成功后在未完成数据同步，节点宕机，从节点升级为主节点，其他实例（线程）获锁成功
+    + C1从主节点获得锁
+    + 主节点复制传输过程中出现宕机，对应锁的key未同步至从节点
+    + 从节点升级为主节点，此时数据出现了丢失
+    + C2请求获取锁成功（key不存在）
+    + C1 C2都获得锁，同一个资源多客户端获得锁，不满足分布式锁的互斥性
+```
+
+
+### 死锁
+死锁是两个或以上线程在执行过程中，出现竞争资源或通信不畅造成一种阻塞的现象，无外力作用下，将无法推进。
+产生的必要条件：
+   + 互斥条件：一个资源每次只能被一个线程使用
+   + 请求与保持条件：一个线程因请求资源失败时，对已获得资源保持不放
+   + 不剥夺条件：对线程已持有资源，在未使用完之前，不可以被剥夺
+   + 循环等待关系：若干个线程对持有资源形成首尾相接，互相等待
+   + 参考资料：https://cloud.tencent.com/developer/article/1628870
